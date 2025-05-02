@@ -1,0 +1,717 @@
+library(shiny)
+library(shinythemes)
+library(shinyWidgets)
+library(shinyFiles)
+library(shinycssloaders)
+library(tidyverse)
+library(plotly)
+library(rlang)
+library(viridis)
+library(DT)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+library(dplyr)
+library(grid)
+
+ui <- navbarPage("LupaCell",
+                 theme = NULL, 
+                 header = tags$head(
+                   tags$link(rel = "stylesheet", type = "text/css", href = "styles.css")
+                 ),
+                 # Home
+                 tabPanel("Home",
+                          fluidPage(
+                            titlePanel("Welcome to LupaCell"),
+                            p("PPC"),
+                            p("Use the tabs above to explore datasets, heatmaps, spatial plots, and more."),
+                            hr(),
+                            fluidRow(
+                              column(6,
+                                     actionButton("save_config", "Save Current Data Settings", class = "btn-success")
+                              ),
+                              column(6,
+                                     fileInput("load_config", "Load Saved Settings", accept = ".rds")
+                              )
+                            )
+                          )
+                 ),
+                 
+                 # Upload Data
+                 # tabPanel("Upload Data",
+                 #          fluidPage(
+                 #            fileInput("user_file", "Upload CSV, TSV, or RDS"),
+                 #            verbatimTextOutput("file_info")
+                 #          )
+                 # ),
+                 
+                 tabPanel("Upload Data",
+                          fluidPage(
+                            fluidRow(
+                              column(6,
+                                     shinyFilesButton("user_file", "Choose CSV, TSV, or RDS File", "Browse", multiple = FALSE)
+                              ),
+                              column(6,
+                                     shinyFilesButton("meta_file", "Load Metadata File", "Browse Metadata", multiple = FALSE)
+                              )
+                            ),
+                            
+                            h4("File Info"),
+                            withSpinner(verbatimTextOutput("file_info"), type = 4)
+                          )
+                 ),
+                 
+                 
+                 ## gene tab
+                 tabPanel("Gene",
+                          fluidPage(
+                            h3("Gene Annotation Tool"),
+                            actionButton("annotate_genes", "Annotate Gene Symbols", class = "btn-primary"),
+                            br(),
+                            actionButton("convert_to_symbol", "Convert to Gene Symbols", class = "btn-warning"),
+                            br(), br(),
+                            withSpinner(DTOutput("gene_annotation_table"), type = 4),
+                            hr(),
+                            h3("Highly Variable Gene Selector"),
+                            numericInput("top_n_hvg", "Number of top variable genes:", value = 2000, min = 10, step = 100),
+                            actionButton("run_hvg", "Select HVGs", class = "btn-primary"),
+                            checkboxInput("overwrite_data", "Overwrite expression matrix with HVGs", value = FALSE),
+                            downloadButton("download_hvg_list", "Download HVG List"),
+                            br(), br(),
+                            withSpinner(DTOutput("hvg_table"), type = 4),
+                            br(),
+                            withSpinner(plotlyOutput("hvg_plot"), type = 4)
+                          )
+                 ),
+                 
+                 
+                 
+                 
+                 # Umap viewer
+                 tabPanel("Umap",
+                          fluidPage(
+                            h3("Interactive UMAP Viewer"),
+                            fluidRow(
+                              column(4,
+                                     uiOutput("umap_x_ui"),
+                                     uiOutput("umap_y_ui"),
+                                     uiOutput("umap_color_ui"),
+                                     
+                                     
+                                     radioButtons("var_type", "Variable Type:",
+                                                  choices = c("Categorical", "Numerical"),
+                                                  inline = TRUE)
+                              ),actionButton("plot_umap", "Generate UMAP Plot", class = "btn-primary"),
+                              column(8,
+                                     plotlyOutput("umap_plot")
+                              )
+                            )
+                          )
+                 ),
+                 
+                 
+                 tabPanel("Heatmap",
+                          fluidPage(
+                            h3("Heatmap Generator"),
+                            pickerInput("genes_heatmap", "Select Genes for Heatmap:", choices = NULL, 
+                                        multiple = TRUE, options = list(`live-search` = TRUE)),
+                            selectInput("group_by_heatmap", "Group by Metadata Variable:", choices = NULL),
+                            actionButton("generate_heatmap", "Generate Heatmap", class = "btn-primary"),
+                            br(), br(),
+                            withSpinner(plotOutput("heatmap_plot", height = "800px"), type = 4)
+                          )
+                 ),
+                 
+                 
+                 absolutePanel(
+                   top = 10, right = 20, width = "auto", draggable = FALSE,
+                   style = "z-index:9999; background-color: rgba(255,255,255,0.8); padding: 5px 10px; border-radius: 5px; font-size: 14px; color: #444;",
+                   textOutput("file_name_label")
+                 )
+                 
+)
+
+
+
+
+
+
+
+
+
+
+
+
+server <- function(input, output, session) {
+  
+  
+  ## track files
+  config <- reactiveValues(
+    count_path = NULL,
+    meta_path = NULL,
+    hvg_genes = NULL
+  )
+  
+  # for above 
+  observeEvent(selected_path(), {
+    config$count_path <- selected_path()
+  })
+  
+  observeEvent(metadata_path(), {
+    config$meta_path <- metadata_path()
+  })
+  
+  observeEvent(hvg_result(), {
+    config$hvg_genes <- hvg_result()$top_genes
+  })
+  
+  
+  # save button
+  observeEvent(input$save_config, {
+    showModal(modalDialog("Saving configuration...", easyClose = TRUE))
+    saveRDS(list(
+      count_path = config$count_path,
+      meta_path = config$meta_path,
+      hvg_genes = config$hvg_genes
+    ), file = "lupacell_config.rds")
+    showNotification("Settings saved to 'lupacell_config.rds'", type = "message")
+  })
+  
+  # load config and reload everything
+  observeEvent(input$load_config, {
+    req(input$load_config$datapath)
+    conf <- readRDS(input$load_config$datapath)
+    
+    conf$count_path <- as.character(conf$count_path)
+    conf$meta_path <- as.character(conf$meta_path)
+    
+    # Load and validate count matrix
+    if (!is.null(conf$count_path) && file.exists(conf$count_path)) {
+      ext <- tools::file_ext(conf$count_path)
+      count_data <- switch(ext,
+                           csv = read.csv(conf$count_path, row.names = 1),
+                           tsv = read.delim(conf$count_path, row.names = 1),
+                           rds = readRDS(conf$count_path),
+                           NULL
+      )
+      if (!is.null(count_data)) {
+        # Apply HVG filter if available
+        if (!is.null(conf$hvg_genes)) {
+          count_data <- count_data[intersect(rownames(count_data), conf$hvg_genes), , drop = FALSE]
+        }
+        assign("uploaded_data", reactive({ count_data }), envir = .GlobalEnv)
+      }
+    }
+    
+    # Load and validate metadata
+    if (!is.null(conf$meta_path) && file.exists(conf$meta_path)) {
+      ext <- tools::file_ext(conf$meta_path)
+      meta_data <- switch(ext,
+                          csv = read.csv(conf$meta_path, row.names = 1),
+                          tsv = read.delim(conf$meta_path, row.names = 1),
+                          rds = readRDS(conf$meta_path),
+                          NULL
+      )
+      if (!is.null(meta_data)) {
+        assign("metadata", reactive({ meta_data }), envir = .GlobalEnv)
+      }
+    }
+    
+    showNotification("Data and metadata loaded from config", type = "message")
+  })
+  
+  
+  
+  
+  
+  
+  
+  #### Upload Data
+  roots <- c(home = normalizePath("~"))
+  shinyFileChoose(input, "user_file", roots = roots, filetypes = c("csv", "tsv", "rds"))
+  
+  # Fix path extraction: use [1,1] to grab actual string
+  selected_path <- reactive({
+    req(input$user_file)
+    parseFilePaths(roots = roots, input$user_file)$datapath[1]
+  })
+  
+  uploaded_data <- reactive({
+    req(config$count_path)
+    path <- config$count_path
+    ext <- tools::file_ext(path)
+    
+    if (!file.exists(path)) {
+      showNotification("Count file not found. Check path or permissions.", type = "error")
+      return(NULL)
+    }
+    
+    switch(ext,
+           csv = read.csv(path, row.names = 1),
+           tsv = read.delim(path, row.names = 1),
+           rds = {
+             dt <- readRDS(path)
+             dt %>% as.matrix() %>% as.data.frame()
+           },
+           {
+             showNotification("Unsupported count file type", type = "error")
+             return(NULL)
+           })
+  })
+  
+  
+  
+  output$file_info <- renderPrint({
+    req(selected_path())
+    path <- selected_path()
+    ext <- tools::file_ext(path)
+    
+    if (!file.exists(path)) {
+      cat("File not found at:", path)
+      return()
+    }
+    
+    size_bytes <- file.info(path)$size
+    size_mb <- size_bytes / 1024^2
+    size_str <- if (size_mb > 1024) {
+      paste0(round(size_mb / 1024, 2), " GB")
+    } else {
+      paste0(round(size_mb, 2), " MB")
+    }
+    
+    df <- uploaded_data()
+    cat("File path:", path, "\n")
+    cat("File size:", size_str, "\n")
+    cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+    cat("File type:", toupper(ext), "\n")
+  })
+  
+  
+  ## header file name 
+  output$file_name_label <- renderText({
+    if (is.null(input$user_file)) {
+      return("Data not selected")
+    }
+    
+    path <- try(selected_path(), silent = TRUE)
+    
+    if (inherits(path, "try-error") || is.null(path) || !file.exists(path)) {
+      return("Data not selected")
+    }
+    
+    paste("Loaded:", basename(path))
+  })
+  
+  
+  
+  shinyFileChoose(input, "meta_file", roots = roots, filetypes = c("csv", "tsv", "rds"))
+  
+  
+  
+  metadata_path <- reactive({
+    req(input$meta_file)
+    parseFilePaths(roots = roots, input$meta_file)$datapath[1]
+  })
+  
+  metadata <- reactive({
+    req(config$meta_path)
+    path <- config$meta_path
+    ext <- tools::file_ext(path)
+    
+    if (!file.exists(path)) {
+      showNotification("Metadata file not found.", type = "error")
+      return(NULL)
+    }
+    
+    switch(ext,
+           csv = read.csv(path, row.names = 1),
+           tsv = read.delim(path, row.names = 1),
+           rds = {
+             dt <- readRDS(path)
+             if (is.data.frame(dt)) return(dt)
+             tryCatch(as.data.frame(as.matrix(dt)), error = function(e) NULL)
+           },
+           {
+             showNotification("Unsupported metadata file type", type = "error")
+             return(NULL)
+           })
+  })
+  
+  output$file_info <- renderPrint({
+    req(selected_path())
+    path <- selected_path()
+    ext <- tools::file_ext(path)
+    
+    if (!file.exists(path)) {
+      cat("File not found at:", path)
+      return()
+    }
+    
+    size_bytes <- file.info(path)$size
+    size_mb <- size_bytes / 1024^2
+    size_str <- if (size_mb > 1024) {
+      paste0(round(size_mb / 1024, 2), " GB")
+    } else {
+      paste0(round(size_mb, 2), " MB")
+    }
+    
+    df <- uploaded_data()
+    cat("File path:", path, "\n")
+    cat("File size:", size_str, "\n")
+    cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+    cat("File type:", toupper(ext), "\n")
+    
+    # metadata info if available
+    if (!is.null(input$meta_file)) {
+      meta_path <- try(metadata_path(), silent = TRUE)
+      if (!inherits(meta_path, "try-error") && file.exists(meta_path)) {
+        cat("Metadata file:", basename(meta_path), "\n")
+      }
+    }
+  })
+  
+  
+  
+  ## gene tab server
+  
+  gene_annotation_result <- eventReactive(input$annotate_genes, {
+    req(uploaded_data())
+    
+    gene_ids <- rownames(uploaded_data())
+    mapping <- AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = gene_ids,
+      keytype = "ENSEMBL",
+      columns = c("SYMBOL", "ENTREZID")
+    )
+    
+    # Join back to preserve order if needed
+    annotated <- data.frame(ENSEMBL = gene_ids) %>%
+      left_join(mapping, by = "ENSEMBL")
+    
+    annotated
+  })
+  
+  output$gene_annotation_table <- DT::renderDataTable({
+    req(gene_annotation_result())
+    DT::datatable(gene_annotation_result(), options = list(pageLength = 10), rownames = FALSE)
+  })
+  
+  
+  
+  
+  observeEvent(input$convert_to_symbol, {
+    req(uploaded_data())
+    
+    current_data <- uploaded_data()
+    gene_ids <- rownames(current_data)
+    
+    mapping <- AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = gene_ids,
+      keytype = "ENSEMBL",
+      columns = c("SYMBOL")
+    ) %>%
+      distinct(ENSEMBL, SYMBOL) %>%
+      filter(!is.na(SYMBOL)) %>%
+      as.data.frame()
+    
+    mapping <- mapping[!duplicated(mapping$ENSEMBL), ]  # Remove duplicates manually
+    
+    common_ids <- intersect(rownames(current_data), mapping$ENSEMBL)
+    
+    new_data <- current_data[common_ids, , drop = FALSE]
+    new_symbols <- mapping$SYMBOL[match(common_ids, mapping$ENSEMBL)]
+    
+    new_symbols <- make.unique(new_symbols)  # Ensure no duplicate rownames
+    
+    rownames(new_data) <- new_symbols
+    
+    assign("uploaded_data", reactive({ new_data }), envir = .GlobalEnv)
+    
+    showNotification("Converted ENSEMBL IDs to Gene Symbols.", type = "message")
+  })
+  
+  
+  
+  
+  
+  # gene norm
+  log_normalize_seurat_style <- function(counts, scale_factor = 10000) {
+    norm_counts <- t(t(counts) / colSums(counts)) * scale_factor
+    log_norm <- log1p(norm_counts)
+    return(log_norm)
+  }
+  
+  get_hvg_vst_style <- function(counts, n_top = 2000, span = 0.3) {
+    gene_means <- rowMeans(counts)
+    gene_vars <- apply(counts, 1, var)
+    names(gene_means) <- names(gene_vars) <- rownames(counts)
+    
+    keep <- gene_means > 0
+    gene_means <- gene_means[keep]
+    gene_vars <- gene_vars[keep]
+    
+    loess_fit <- loess(gene_vars ~ gene_means, span = span)
+    expected_vars <- predict(loess_fit, newdata = gene_means)
+    
+    residual_var <- (gene_vars - expected_vars) / expected_vars
+    residual_var[!is.finite(residual_var)] <- NA
+    
+    ranked_genes <- sort(residual_var, decreasing = TRUE, na.last = NA)
+    top_genes <- names(ranked_genes)[1:min(n_top, length(ranked_genes))]
+    
+    return(list(top_genes = top_genes,
+                mean = gene_means,
+                sd = sqrt(gene_vars)))
+  }
+  
+  
+  
+  ## hvg egenes
+  hvg_result <- eventReactive(input$run_hvg, {
+    req(uploaded_data())
+    mat <- uploaded_data()
+    
+    # Filter genes with total counts >= 1
+    mat <- mat[rowSums(mat) >= 1, , drop = FALSE]
+    
+    # Log-normalize
+    log_norm <- log_normalize_seurat_style(mat)
+    
+    # HVG selection
+    hvg_info <- get_hvg_vst_style(log_norm, n_top = input$top_n_hvg)
+    
+    # Optional overwrite
+    if (input$overwrite_data) {
+      updated <- uploaded_data()[hvg_info$top_genes, , drop = FALSE]
+      assign("uploaded_data", reactive({ updated }), envir = .GlobalEnv)
+    }
+    
+    return(hvg_info)
+  })
+  
+  
+  # plotly mean vs sd plot
+  
+  output$hvg_plot <- renderPlotly({
+    req(hvg_result())
+    gene_means <- hvg_result()$mean
+    gene_sds <- hvg_result()$sd
+    highlight <- rep("Other", length(gene_means))
+    names(highlight) <- names(gene_means)
+    highlight[hvg_result()$top_genes] <- "HVG"
+    
+    df <- data.frame(
+      Gene = names(gene_means),
+      Mean = gene_means,
+      SD = gene_sds,
+      Group = factor(highlight)
+    )
+    
+    plot_ly(
+      data = df,
+      x = ~Mean,
+      y = ~SD,
+      type = 'scatter',
+      mode = 'markers',
+      color = ~Group,
+      text = ~paste0("Gene: ", Gene, "<br>Mean: ", round(Mean, 3), "<br>SD: ", round(SD, 3)),
+      hoverinfo = 'text',
+      marker = list(size = 5, opacity = 0.6)
+    ) %>%
+      layout(title = "HVG Selection: Mean vs SD",
+             xaxis = list(title = "Mean (log-normalized)"),
+             yaxis = list(title = "Standard Deviation"))
+  })
+  
+  
+  
+  #hvg table
+  output$hvg_table <- DT::renderDataTable({
+    req(hvg_result())
+    genes <- hvg_result()$top_genes
+    DT::datatable(data.frame(Gene = head(genes, 5)), options = list(dom = 't'), rownames = FALSE)
+  })
+  
+  
+  #downloader
+  
+  output$download_hvg_list <- downloadHandler(
+    filename = function() paste0("HVG_top_", input$top_n_hvg, ".csv"),
+    content = function(file) {
+      write.csv(data.frame(Gene = hvg_result()$top_genes), file, row.names = FALSE)
+    }
+  )
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  ## UMAP server
+  
+  umap_plot_data <- eventReactive(input$plot_umap, {
+    req(metadata(), input$umap_x, input$umap_y, input$umap_color)
+    
+    df <- metadata()
+    
+    x_vals <- df[[input$umap_x]]
+    y_vals <- df[[input$umap_y]]
+    color_vals <- df[[input$umap_color]]
+    
+    if (input$var_type == "Numerical") {
+      color_vals <- suppressWarnings(as.numeric(color_vals))
+    } else {
+      color_vals <- as.factor(color_vals)
+    }
+    
+    list(
+      df = df,
+      x_vals = x_vals,
+      y_vals = y_vals,
+      color_vals = color_vals
+    )
+  })
+  
+  
+  output$umap_plot <- renderPlotly({
+    req(umap_plot_data())
+    vals <- umap_plot_data()
+    
+    plot_ly(
+      data = vals$df,
+      x = ~vals$x_vals,
+      y = ~vals$y_vals,
+      type = 'scatter',
+      mode = 'markers',
+      marker = list(size = 6, opacity = 0.8),
+      color = ~vals$color_vals,
+      text = ~paste0(
+        "ID: ", rownames(vals$df), "<br>",
+        input$umap_x, ": ", vals$x_vals, "<br>",
+        input$umap_y, ": ", vals$y_vals, "<br>",
+        input$umap_color, ": ", vals$color_vals
+      ),
+      hoverinfo = 'text'
+    ) %>%
+      layout(title = "UMAP Plot")
+  })
+  
+  
+  
+  output$umap_x_ui <- renderUI({
+    req(metadata())
+    selectInput("umap_x", "X Axis:", choices = colnames(metadata()), selected = colnames(metadata())[1])
+  })
+  
+  output$umap_y_ui <- renderUI({
+    req(metadata())
+    selectInput("umap_y", "Y Axis:", choices = colnames(metadata()), selected = colnames(metadata())[2])
+  })
+  
+  output$umap_color_ui <- renderUI({
+    req(metadata())
+    selectInput("umap_color", "Color by:", choices = colnames(metadata()))
+  })
+  
+  
+  
+  
+  ### Heatmap section
+  
+  # Populate gene and metadata options once files are loaded
+  observe({
+    req(uploaded_data(), metadata())
+    updatePickerInput(session, "genes_heatmap", choices = rownames(uploaded_data()))
+    updateSelectInput(session, "group_by_heatmap", choices = colnames(metadata()))
+  })
+  
+  # Generate Heatmap
+  observeEvent(input$generate_heatmap, {
+    output$heatmap_plot <- renderPlot({
+      req(uploaded_data(), metadata(), input$genes_heatmap, input$group_by_heatmap)
+      
+      selected_genes <- input$genes_heatmap
+      group_var <- input$group_by_heatmap
+      
+      
+      
+      
+      log_norm <- uploaded_data()
+      meta <- metadata()
+      
+      
+      meta[[group_var]] <- as.factor(meta[[group_var]])
+      
+      desired_order <- unique(meta[[group_var]])
+      
+      custom_colors <- colorRamp2(c(-2, 0, 2), c("#008080", "#F5F5DC", "#FF7F50"))
+      
+      circle_fun <- function(x, y, w, h, v, color) {
+        grid.rect(x = x, y = y, width = w, height = h, gp = gpar(fill = "white", col = NA))
+        grid.circle(x = x, y = y, r = unit(v / 5000, "npc"), gp = gpar(fill = color, col = "black"))
+      }
+      
+      log_norm_matrix <- log_norm[selected_genes, , drop = FALSE] %>%
+        t() %>% as.data.frame() %>%
+        mutate(group = meta[[group_var]][match(rownames(.), rownames(meta))])
+      
+      dt_matrix_percent <- log_norm[selected_genes, , drop = FALSE] %>%
+        t() %>% as.data.frame() %>%
+        mutate(group = meta[[group_var]][match(rownames(.), rownames(meta))]) %>%
+        group_by(group) %>%
+        summarize(across(all_of(selected_genes), ~ mean(.x > 0) * 100))
+      
+      log_norm_matrix <- log_norm_matrix %>%
+        group_by(group) %>%
+        summarize(across(all_of(selected_genes), mean, na.rm = TRUE)) %>%
+        ungroup() %>%
+        mutate(across(where(is.numeric), ~ ifelse(sd(.) == 0 | all(is.na(.)), 0, as.numeric(scale(.)))))
+      
+      mat_numeric <- t(as.matrix(log_norm_matrix[, -1]))
+      colnames(mat_numeric) <- log_norm_matrix$group
+      rownames(mat_numeric) <- selected_genes
+      
+      percent_matrix <- t(as.matrix(dt_matrix_percent[, -1]))
+      colnames(percent_matrix) <- dt_matrix_percent$group
+      rownames(percent_matrix) <- selected_genes
+      
+      mat_numeric <- mat_numeric[, desired_order, drop = FALSE]
+      percent_matrix <- percent_matrix[, desired_order, drop = FALSE]
+      
+      heatmap_obj <- Heatmap(
+        mat_numeric, name = "Scaled Expression", col = custom_colors,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          circle_fun(x, y, width, height, percent_matrix[i, j], fill)
+        },
+        show_row_names = TRUE, show_column_names = TRUE, cluster_columns = FALSE,
+        column_names_gp = gpar(fontface = "bold", fontsize = 16, col = "black", rot = 45),
+        row_names_gp = gpar(fontface = "bold", fontsize = 16, col = "black"),
+        heatmap_legend_param = list(ticks_gp = gpar(fontface = "bold", fontsize = 16, col = "black")),
+        column_names_rot = 45
+      )
+      
+      draw(heatmap_obj)
+    })
+  })
+  
+  
+  
+  
+}
+
+
+
+
+shinyApp(ui, server)
+

@@ -1,0 +1,178 @@
+---
+title: "testing notebook"
+output: html_notebook
+---
+ 
+
+```{r}
+library(tidyverse)
+library(Matrix)
+dt = readRDS("LIBD_mrna_count_18011genes_3639cells.rds")
+
+dt = dt %>% as.matrix() %>% as.data.frame()
+
+sum(dt)
+
+
+head(dt)
+
+meta = readRDS("LIBD_spatial_3639cells_2cols.rds")
+
+
+
+
+ptime <- read.delim("DLPFC-pSM_values-2-28-2023.tsv", header = FALSE)
+colnames(ptime) <- "pseudotime"
+
+meta$pseudotime = ptime$pseudotime
+
+
+umap = read.csv("151673_8comps_st_data_pca.csv")
+
+
+meta =cbind(meta,umap)
+
+truth = readRDS("Manual_annotation_3639cells.rds")
+
+
+
+meta$truth <- truth$`Manual annotation`[rownames(meta)]
+
+
+
+cluster = read.csv("151673_8comps_calc_cluster.csv")
+meta$cluster <- cluster$X_pca_kmeans[match(rownames(meta), cluster$X)]
+
+#saveRDS(meta,"LIBD_spatial_3639cells_meta.rds")
+
+
+meta = readRDS("LIBD_spatial_3639cells_meta.rds")
+```
+
+
+
+```{r}
+library(matrixStats)
+
+find_hvg_vst <- function(counts, n_top = 2000) {
+  # counts: gene x cell matrix (or data.frame)
+  
+  # Calculate mean and variance per gene
+  gene_means <- rowMeans(counts)
+  gene_vars <- rowVars(as.matrix(counts))
+  
+  # Compute dispersion (variance-to-mean ratio)
+  dispersion <- gene_vars / gene_means
+  dispersion[is.na(dispersion)] <- 0
+  
+  # Log1p transform (same as Seurat)
+  gene_means_log <- log1p(gene_means)
+  dispersion_log <- log1p(dispersion)
+  
+  # Fit loess curve
+  loess_fit <- loess(dispersion_log ~ gene_means_log)
+  dispersion_fit <- predict(loess_fit, gene_means_log)
+  
+  # Compute standardized residuals (difference from expected)
+  standardized_disp <- dispersion_log - dispersion_fit
+  
+  # Select top genes
+  top_genes <- order(standardized_disp, decreasing = TRUE)[1:n_top]
+  names(top_genes) <- rownames(counts)[top_genes]
+  
+  return(names(top_genes))
+}
+
+
+gn = find_hvg_vst(dt)
+
+
+
+
+
+
+sd=readRDS("lupacell_config.rds")
+```
+
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(scico)
+
+# Load your data
+meta <- readRDS("LIBD_spatial_3639cells_meta.rds")
+dt <- readRDS("LIBD_mrna_count_18011genes_3639cells.rds") %>% as.matrix() %>% as.data.frame()
+
+# Genes of interest
+
+all_genes <- unique(c("ENSG00000105507","ENSG00000277150","ENSG00000123560"))
+
+# Filter out missing genes
+all_genes <- intersect(all_genes, rownames(dt))
+
+# Subset matrix and transpose
+matrix_heat <- t(dt[all_genes, ]) %>% as.data.frame()
+matrix_heat$cell <- rownames(matrix_heat)
+
+# Add pseudotime
+stopifnot("pseudotime" %in% colnames(meta))  # Check column exists
+matrix_heat <- matrix_heat %>%
+  left_join(
+    meta %>%
+      mutate(cell = rownames(meta)) %>%
+      dplyr::select(cell, pseudotime),
+    by = "cell"
+  ) %>%
+  drop_na(pseudotime)
+
+# Bin pseudotime
+matrix_heat <- matrix_heat %>%
+  arrange(pseudotime) %>%
+  mutate(time_bin = ntile(pseudotime, 200))  # Fixed 200 bins
+
+# Average expression per bin
+avg_expr <- matrix_heat %>%
+  group_by(time_bin) %>%
+  summarize(across(all_of(all_genes), mean, na.rm = TRUE)) %>%
+  column_to_rownames("time_bin") %>%
+  t() %>%
+  as.data.frame()
+
+# Scale expression across bins
+scaled_expr <- t(scale(t(avg_expr)))
+
+# Cap values for color scale
+scaled_expr[scaled_expr > 2] <- 2
+scaled_expr[scaled_expr < -2] <- -2
+
+# Define color functions
+col_fun_expr <- colorRamp2(c(-2, 0, 2), scico(3, palette = "roma", direction = -1))
+col_fun_bins <- colorRamp2(1:200, viridis::plasma(200))
+
+# Add heatmap annotation for pseudotime bins
+bottom_anno <- HeatmapAnnotation("Pseudotime Bin" = 1:200,
+                                 col = list("Pseudotime Bin" = col_fun_bins),
+                                 show_annotation_name = FALSE)
+
+# Define highlight genes
+highlight_genes <- c('C1QA','C1QB','C3AR1','COLEC12','FCN1','CFP','C5','CR1')
+
+# Plot heatmap
+Heatmap(scaled_expr,
+        col = col_fun_expr,
+        name = "Scaled expression",
+        cluster_columns = FALSE,
+        cluster_rows = TRUE,
+        show_column_names = FALSE,
+        bottom_annotation = bottom_anno,
+        row_names_gp = gpar(
+          col = ifelse(rownames(scaled_expr) %in% highlight_genes, "red", "black"),
+          fontsize = 10
+        ))
+
+```
+
